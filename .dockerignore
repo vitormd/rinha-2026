@@ -1,0 +1,15 @@
+.git
+.github
+.idea
+.vscode
+.claude
+*.md
+participants
+test
+results
+scripts
+data-generator
+docs
+dataset/dataset.bin
+dataset/labels.bin
+dataset/ivf.bin

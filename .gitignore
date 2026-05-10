@@ -1,0 +1,9 @@
+dataset/references.json
+dataset/dataset.bin
+dataset/labels.bin
+dataset/ivf.bin
+test/results.json
+results/
+*.test
+*.out
+.DS_Store
