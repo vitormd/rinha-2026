@@ -1,24 +1,22 @@
-# Rinha de Backend 2026 — submission stack
+# Rinha de Backend 2026 — submission stack (v2).
+#
+# Pulls the API image pre-built (multi-stage build with baked ivf.bin) from
+# Docker Hub. nginx ↔ Go APIs talk over Unix Domain Sockets on a shared
+# tmpfs volume (`sock`) — no TCP loopback in the data path.
 #
 # Total budget across all services: 1.0 CPU, 350 MB RAM.
-# Layout (CPU / mem):
-#   proxy: 0.10 / 20 MB    nginx:alpine-slim
-#   api1:  0.45  / 165 MB
-#   api2:  0.45  / 165 MB
-#                                = 1.00 / 350 MB
 
 services:
-  api1:
-    build:
-      context: .
-      dockerfile: api/Dockerfile
-    image: rinha26-api:latest
+  api1: &api
+    image: vitormd/rinha26-api:vitormd-go-v2
     environment:
-      LISTEN_ADDR: ":8080"
+      LISTEN_ADDR: "/run/sock/api1.sock"
       GOMAXPROCS: "1"
       GOMEMLIMIT: "150MiB"
-      N_PROBE_FAST: "${N_PROBE_FAST:-8}"
-      N_PROBE_FULL: "${N_PROBE_FULL:-28}"
+      N_PROBE_FAST: "8"
+      N_PROBE_FULL: "28"
+    volumes:
+      - sock:/run/sock
     networks:
       - rinha
     deploy:
@@ -28,28 +26,20 @@ services:
           memory: "165M"
 
   api2:
-    image: rinha26-api:latest
+    <<: *api
     environment:
-      LISTEN_ADDR: ":8080"
+      LISTEN_ADDR: "/run/sock/api2.sock"
       GOMAXPROCS: "1"
       GOMEMLIMIT: "150MiB"
-      N_PROBE_FAST: "${N_PROBE_FAST:-8}"
-      N_PROBE_FULL: "${N_PROBE_FULL:-28}"
-    networks:
-      - rinha
-    depends_on:
-      - api1
-    deploy:
-      resources:
-        limits:
-          cpus: "0.45"
-          memory: "165M"
+      N_PROBE_FAST: "8"
+      N_PROBE_FULL: "28"
 
   proxy:
     image: nginx:alpine-slim
     command: ["nginx", "-c", "/etc/nginx/nginx.conf"]
     volumes:
       - ./LB/nginx.conf:/etc/nginx/nginx.conf:ro
+      - sock:/run/sock
     ports:
       - "9999:9999"
     networks:
@@ -62,6 +52,9 @@ services:
         limits:
           cpus: "0.10"
           memory: "20M"
+
+volumes:
+  sock:
 
 networks:
   rinha:
