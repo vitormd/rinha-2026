@@ -6,7 +6,7 @@
 #   api      → final small image: api binary + ivf.bin + json configs
 
 # --- builder ---
-FROM golang:1.23-alpine AS builder
+FROM golang:1.24-alpine AS builder
 WORKDIR /src
 COPY go.mod go.sum ./
 RUN go mod download
@@ -36,15 +36,15 @@ RUN ls -la ./dataset/
 
 # --- final image: api binary + baked IVF index + json configs ---
 FROM alpine:3.20 AS api
-RUN adduser -D -u 10001 app
 WORKDIR /data
 COPY --from=builder /out/api /usr/local/bin/api
 COPY --from=dataset /work/dataset/ivf.bin /data/ivf.bin
 COPY dataset/mcc_risk.json /data/mcc_risk.json
 COPY dataset/normalization.json /data/normalization.json
-USER app
+# Run as root so the api process can bind a Unix socket on the shared
+# `/run/sock` volume that nginx (also root in its alpine-slim image) reads
+# from. UID isolation isn't a concern in this single-tenant benchmark image.
 ENV DATA_DIR=/data \
-    LISTEN_ADDR=:8080 \
+    LISTEN_ADDR=/run/sock/api.sock \
     GOMAXPROCS=1
-EXPOSE 8080
 ENTRYPOINT ["/usr/local/bin/api"]

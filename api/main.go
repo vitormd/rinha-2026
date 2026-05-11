@@ -1,12 +1,14 @@
 package main
 
 import (
-	"io"
 	"log"
-	"net/http"
+	"net"
 	"os"
 	"runtime"
 	"runtime/debug"
+	"strings"
+
+	"github.com/valyala/fasthttp"
 
 	"rinha26/vector-search/ivf"
 	"rinha26/vector-search/vec"
@@ -24,7 +26,11 @@ var responses = [6][]byte{
 	[]byte(`{"approved":false,"fraud_score":1}`),
 }
 
-const maxBodyBytes = 8 << 10
+var (
+	pathReady       = []byte("/ready")
+	pathFraudScore  = []byte("/fraud-score")
+	contentTypeJSON = []byte("application/json")
+)
 
 type server struct {
 	index     *ivf.Index
@@ -39,7 +45,7 @@ func main() {
 	debug.SetGCPercent(envIntDefault("GOGC", 100))
 
 	dataDir := envDefault("DATA_DIR", "/data")
-	listenAddr := envDefault("LISTEN_ADDR", ":8080")
+	listenAddr := envDefault("LISTEN_ADDR", "/run/sock/api.sock")
 	probeFast := envIntDefault("N_PROBE_FAST", 8)
 	probeFull := envIntDefault("N_PROBE_FULL", 28)
 
@@ -69,36 +75,74 @@ func main() {
 		probeFull: probeFull,
 	}
 
-	mux := http.NewServeMux()
-	mux.HandleFunc("/ready", s.handleReady)
-	mux.HandleFunc("/fraud-score", s.handleFraudScore)
+	listener, err := listen(listenAddr)
+	if err != nil {
+		log.Fatalf("listen %s: %v", listenAddr, err)
+	}
+
+	srv := &fasthttp.Server{
+		Handler:                       s.handler,
+		Name:                          "rinha26",
+		ReadBufferSize:                4096,
+		WriteBufferSize:               1024,
+		MaxRequestBodySize:            8 << 10,
+		NoDefaultServerHeader:         true,
+		NoDefaultContentType:          true,
+		NoDefaultDate:                 true,
+		DisableHeaderNamesNormalizing: true,
+	}
 
 	log.Printf("listening on %s", listenAddr)
-	srv := &http.Server{Addr: listenAddr, Handler: mux}
-	if err := srv.ListenAndServe(); err != nil {
-		log.Fatalf("listen: %v", err)
+	if err := srv.Serve(listener); err != nil {
+		log.Fatalf("serve: %v", err)
 	}
 }
 
-func (s *server) handleReady(w http.ResponseWriter, _ *http.Request) {
-	w.WriteHeader(http.StatusOK)
+// listen returns a net.Listener for either a Unix domain socket (path starts
+// with '/' or '@') or a TCP address.
+//
+// For UDS, any stale file at the path is removed first, and the socket is
+// chmod'd to 0666 so a different uid (e.g. nginx) can connect.
+func listen(addr string) (net.Listener, error) {
+	if strings.HasPrefix(addr, "/") || strings.HasPrefix(addr, "@") {
+		if strings.HasPrefix(addr, "/") {
+			_ = os.Remove(addr)
+		}
+		l, err := net.Listen("unix", addr)
+		if err != nil {
+			return nil, err
+		}
+		if strings.HasPrefix(addr, "/") {
+			if err := os.Chmod(addr, 0o666); err != nil {
+				log.Printf("warning: chmod %s: %v", addr, err)
+			}
+		}
+		return l, nil
+	}
+	return net.Listen("tcp", addr)
 }
 
-func (s *server) handleFraudScore(w http.ResponseWriter, r *http.Request) {
-	if r.Method != http.MethodPost {
-		http.Error(w, "", http.StatusMethodNotAllowed)
-		return
+func (s *server) handler(ctx *fasthttp.RequestCtx) {
+	path := ctx.Path()
+	switch {
+	case bytesEqual(path, pathFraudScore):
+		s.handleFraudScore(ctx)
+	case bytesEqual(path, pathReady):
+		ctx.SetStatusCode(fasthttp.StatusOK)
+	default:
+		ctx.SetStatusCode(fasthttp.StatusNotFound)
 	}
+}
 
-	body, err := io.ReadAll(io.LimitReader(r.Body, maxBodyBytes))
-	if err != nil {
-		http.Error(w, "", http.StatusBadRequest)
+func (s *server) handleFraudScore(ctx *fasthttp.RequestCtx) {
+	if !ctx.IsPost() {
+		ctx.SetStatusCode(fasthttp.StatusMethodNotAllowed)
 		return
 	}
 
 	var query [vec.Dim]float64
-	if err := vec.FromPayload(body, s.norm, s.mcc, &query); err != nil {
-		http.Error(w, "", http.StatusBadRequest)
+	if err := vec.FromPayload(ctx.PostBody(), s.norm, s.mcc, &query); err != nil {
+		ctx.SetStatusCode(fasthttp.StatusBadRequest)
 		return
 	}
 
@@ -106,8 +150,20 @@ func (s *server) handleFraudScore(w http.ResponseWriter, r *http.Request) {
 	if fraudCount < 0 || fraudCount > 5 {
 		fraudCount = 5
 	}
-	w.Header().Set("Content-Type", "application/json")
-	_, _ = w.Write(responses[fraudCount])
+	ctx.SetContentTypeBytes(contentTypeJSON)
+	ctx.SetBody(responses[fraudCount])
+}
+
+func bytesEqual(a, b []byte) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		if a[i] != b[i] {
+			return false
+		}
+	}
+	return true
 }
 
 func envDefault(key, def string) string {
