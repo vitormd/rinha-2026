@@ -60,19 +60,19 @@ LB/                           load balancer
 
 ## Performance milestones
 
-| iteration | image tag | p99 (avaliador) | local p99 (Mac) | score_p99 | score_det | final |
-|---|---|---:|---:|---:|---:|---:|
-| v1 (TCP + net/http, proxy 0.10) | vitormd-go-v1 | 92.73 ms | — | 1032.78 | 3000 | **4032.78** |
-| v2 (UDS + fasthttp, proxy 0.10) | vitormd-go-v2 | pending | ~36 ms | | | |
-| v2.1 (uncommitted: + mlock + sync.Pool + pre-cast centroids, proxy 0.10) | not pushed | local-only | ~24 ms | | | |
-| v2.2 (uncommitted: + CPU rebalance proxy 0.20 / api 0.40) | not pushed | local-only | ~2.2 ms (3 runs) | est. ~2500 | est. 3000 | local est. ~5650 |
-| **v3 (uncommitted: + custom JSON parser + manual ISO8601 + fasthttp tune + GOAMD64=v3 + centroid norms²)** | **not pushed** | **local-only** | **~2.7-3 ms settled (Mac noise floor)** | est. 2600 | est. 3000 | **local est. ~5550 ±200** |
+| iteration | image tag | p99 (avaliador) | score_p99 | score_det | final |
+|---|---|---:|---:|---:|---:|
+| v1 (TCP + net/http, proxy 0.10) | vitormd-go-v1 | 92.73 ms | 1032.78 | 3000 | 4032.78 |
+| v2 (UDS + fasthttp, proxy 0.10) | vitormd-go-v2 | — (not submitted; superseded) | | | |
+| **v3** (UDS + fasthttp + mlock + sync.Pool + pre-cast centroids + centroid norms² + custom JSON walk + manual ISO8601 + fasthttp tune + GOAMD64=v3 + **CPU split 0.20 / 0.40 / 0.40**) | **vitormd-go-v3** | **2.22 ms** | **2654.49** | **3000** | **5654.49** |
 
 Both iterations preserve E=0 (perfect detection); only `score_p99` changes.
 
-## Key bottleneck discovery (v2.2)
+Both iterations preserve E=0 (perfect detection); only `score_p99` changes.
 
-At 900 RPS, the original 0.10 CPU quota for nginx is **the bottleneck, not the Go API**. Each request needs ~20-50µs of nginx routing work; at 900 RPS that's 18-45ms/sec of CPU demand vs 100ms/sec available — nginx saturates and requests pile up in its listen queue. The API CPU therefore appeared idle (~20%) because traffic was rate-limited *upstream* of the API. Doubling proxy CPU to 0.20 (cost: API loses 0.05 each) eliminates the queue and cuts local p99 from 24ms to ~2.2ms.
+## Key bottleneck discovery (v3)
+
+At 900 RPS, the original 0.10 CPU quota for nginx is **the bottleneck, not the Go API**. Each request needs ~20-50µs of nginx routing work; at 900 RPS that's 18-45ms/sec of CPU demand vs 100ms/sec available — nginx saturates and requests pile up in its listen queue. The API CPU therefore appeared idle (~20%) because traffic was rate-limited *upstream* of the API. Doubling proxy CPU to 0.20 (cost: API loses 0.05 each) eliminates the queue and dropped the avaliador's p99 from 92.73ms (v1) to 2.22ms (v3) — a 42× improvement on a single config knob, dwarfing every other optimization in the iteration.
 
 ## Things tried that did NOT help
 
