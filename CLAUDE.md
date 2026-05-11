@@ -60,12 +60,24 @@ LB/                           load balancer
 
 ## Performance milestones
 
-| iteration | image tag | p99 (avaliador) | score_p99 | score_det | final |
-|---|---|---:|---:|---:|---:|
-| v1 (TCP + net/http) | vitormd-go-v1 | 92.73 ms | 1032.78 | 3000 | **4032.78** |
-| v2 (UDS + fasthttp) | vitormd-go-v2 | pending | | | |
+| iteration | image tag | p99 (avaliador) | local p99 (Mac) | score_p99 | score_det | final |
+|---|---|---:|---:|---:|---:|---:|
+| v1 (TCP + net/http, proxy 0.10) | vitormd-go-v1 | 92.73 ms | — | 1032.78 | 3000 | **4032.78** |
+| v2 (UDS + fasthttp, proxy 0.10) | vitormd-go-v2 | pending | ~36 ms | | | |
+| v2.1 (uncommitted: + mlock + sync.Pool + pre-cast centroids, proxy 0.10) | not pushed | local-only | ~24 ms | | | |
+| v2.2 (uncommitted: + CPU rebalance proxy 0.20 / api 0.40) | not pushed | local-only | ~2.2 ms (3 runs) | est. ~2500 | est. 3000 | local est. ~5650 |
+| **v3 (uncommitted: + custom JSON parser + manual ISO8601 + fasthttp tune + GOAMD64=v3 + centroid norms²)** | **not pushed** | **local-only** | **~2.7-3 ms settled (Mac noise floor)** | est. 2600 | est. 3000 | **local est. ~5550 ±200** |
 
 Both iterations preserve E=0 (perfect detection); only `score_p99` changes.
+
+## Key bottleneck discovery (v2.2)
+
+At 900 RPS, the original 0.10 CPU quota for nginx is **the bottleneck, not the Go API**. Each request needs ~20-50µs of nginx routing work; at 900 RPS that's 18-45ms/sec of CPU demand vs 100ms/sec available — nginx saturates and requests pile up in its listen queue. The API CPU therefore appeared idle (~20%) because traffic was rate-limited *upstream* of the API. Doubling proxy CPU to 0.20 (cost: API loses 0.05 each) eliminates the queue and cuts local p99 from 24ms to ~2.2ms.
+
+## Things tried that did NOT help
+
+- **Tighter CFS period (10ms instead of 100ms)** — locally went from p99 36ms → 87ms. Theory was CFS throttling caused queueing bursts; data says no. Avaliador may behave differently, but conservative: don't ship this. Also conflicts with the `cpus:` directive (Docker rejects both `Nano CPUs` and `CPU Period` set together).
+- **GOMAXPROCS=2** — local statistically identical to GOMAXPROCS=1 (~36ms vs 38ms). Splits the 0.45 CPU quota across two OS threads, gaining I/O-wait overlap but losing scheduler simplicity. Inconclusive; kept GOMAXPROCS=1.
 
 ## Critical decisions (with rationale — don't undo without re-verifying 0 errors)
 
@@ -81,6 +93,15 @@ Both iterations preserve E=0 (perfect detection); only `score_p99` changes.
 10. **API listens on UDS, not TCP** — `LISTEN_ADDR` env var: a path like `/run/sock/api1.sock` triggers `net.Listen("unix", ...)`; `:8080` falls back to TCP. nginx upstream uses `server unix:/run/sock/apiN.sock;`. Saves ~30µs of TCP loopback per request under load.
 11. **fasthttp instead of net/http** — net/http allocates a Request/ResponseWriter pair per request; fasthttp uses a pooled `RequestCtx`. Trade-off: fasthttp API isn't compatible with stdlib middleware, but we don't use any.
 12. **API container runs as root** — required to bind the UDS on the `/run/sock` shared tmpfs volume (the named volume is owned by root at mount time and chown can't run before bind). Single-tenant benchmark image; no security concern.
+13. **`mlock` on the mmap'd `ivf.bin`** — once `PreTouch` faults the pages in, `syscall.Mlock(i.mmap)` pins them in RAM. Avoids rare page-fault outliers in p99 under memory pressure. Logs a warning if it fails (insufficient `ulimit -l` or missing `CAP_IPC_LOCK`).
+14. **Pre-cast centroids to float64 at `Open`** — `Index.CentroidsF64` holds the f32 table promoted to f64 once at startup. The cluster-pick hot path needs f64 distance (point 3 above) but no longer pays `K*Dim` casts per request.
+15. **`sync.Pool` for the centroid-distances buffer** — request hot path used to `make([]float64, 4096)` (~33 KB) per call. Pool-reuse removes that allocation entirely → less GC pressure, lower p99 tail under sustained load.
+16. **CPU split: proxy 0.20 / api 0.40 / api 0.40** (not 0.10 / 0.45 / 0.45) — see "Key bottleneck discovery" above. The API CPU loss is more than offset by removing the nginx queue.
+17. **Pre-computed centroid squared norms** (`Index.CentroidNormsSq`) — the per-request centroid scan uses the identity `||q-c||² = ||q||² + ||c||² - 2·<q,c>`, dropping the constant `||q||²` (irrelevant for ranking). The hot loop becomes one FMA per dim instead of sub+mul+add → ~3× fewer FP ops. Verified to maintain bit-identical top-N ordering (0 errors).
+18. **`GOAMD64=v3` build flag** — targets Haswell+ (AVX2, BMI2, FMA, MOVBE). Avaliador's Mac Mini Late 2014 is Haswell, so v3 is safe and lets the Go compiler emit better code than the v1 baseline.
+19. **`jsonparser.EachKey` single-pass parse** — replaces ~13 separate `Get(...)` calls in `vec.FromPayload` with one walk of the JSON. Captures every required field's raw bytes in one go, then post-processes.
+20. **Manual ISO 8601 parser** (`parseISO8601Z`) — the data-generator emits the fixed format `YYYY-MM-DDTHH:MM:SSZ`. A 20-line byte-level parser replaces `time.Parse(time.RFC3339, ...)` (~1µs → ~200ns/call). `dayOfWeekMonZero` uses Sakamoto's algorithm to mirror the data-generator's C code exactly. `minutesBetween` works across months via Howard Hinnant's days-since-epoch formula.
+21. **fasthttp server tuning** — tight read/write buffers (1-4 KB), no default Server/Date/Content-Type headers, `DisableHeaderNamesNormalizing`, `Concurrency=256`. Saves bytes and cycles per response.
 
 ## Key files
 
@@ -93,8 +114,8 @@ Both iterations preserve E=0 (perfect detection); only `score_p99` changes.
 | `vector-search/ivf/rng.go` | LCG (deterministic 64-bit PCG-style) used to seed k-means++ |
 | `vector-search/ivf/kmeans.go` | k-means++ init + Lloyd iterations, parallel assign |
 | `vector-search/ivf/build.go` | Build orchestration: k-means → groupByCluster → computeBlockOffsets → quantizeBlocks → writeIndex |
-| `vector-search/ivf/loader.go` | Open / Close / PreTouch (mmap PROT_READ) |
-| `vector-search/ivf/search.go` | FraudScore (2-stage), scanClusters, updateTopK; calls `simd.DistBlock` |
+| `vector-search/ivf/loader.go` | Open / Close / PreTouch (mmap PROT_READ + mlock); also pre-casts centroids to f64 (`Index.CentroidsF64`) |
+| `vector-search/ivf/search.go` | FraudScore (2-stage), scanClusters, updateTopK; calls `simd.DistBlock`; sync.Pool'd centroidDistances buffer |
 | `vector-search/ivf/unsafe_views.go` | bytesToFloat32/Uint32/Int16 — uses `unsafe.Slice` (not deprecated SliceHeader) |
 | `infra/simd/dist.go` | layout consts + Block/Query/Distances types |
 | `infra/simd/dist_amd64.{go,s}` | AVX2 SIMD: 8 i64 distances per block + threshold pruning |

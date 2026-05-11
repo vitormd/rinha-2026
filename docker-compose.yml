@@ -4,11 +4,11 @@
 # Docker Hub. nginx ↔ Go APIs talk over Unix Domain Sockets on a shared
 # tmpfs volume (`sock`) — no TCP loopback in the data path.
 #
-# Total budget across all services: 1.0 CPU, 350 MB RAM.
+# Total budget: 1.0 CPU (api×0.40 + api×0.40 + proxy×0.20), 350 MB RAM.
 
 services:
   api1: &api
-    image: vitormd/rinha26-api:vitormd-go-v2
+    image: vitormd/rinha26-api:vitormd-go-v3
     environment:
       LISTEN_ADDR: "/run/sock/api1.sock"
       GOMAXPROCS: "1"
@@ -22,7 +22,7 @@ services:
     deploy:
       resources:
         limits:
-          cpus: "0.45"
+          cpus: "0.40"
           memory: "165M"
 
   api2:
@@ -50,7 +50,7 @@ services:
     deploy:
       resources:
         limits:
-          cpus: "0.10"
+          cpus: "0.20"
           memory: "20M"
 
 volumes:

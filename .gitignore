@@ -7,3 +7,5 @@ results/
 *.test
 *.out
 .DS_Store
+# Local dev override — keep submission branch image-only.
+docker-compose.override.yml

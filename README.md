@@ -8,11 +8,11 @@ Implementação Go para o desafio [Rinha de Backend 2026](https://github.com/zan
 client
   │
   ▼
-nginx (porta 9999)            0.10 CPU /  20 MB
+nginx (porta 9999)            0.20 CPU /  20 MB
   ├─ round-robin via UDS
   │
-  ├──▶ api 1 (Go)              0.45 CPU / 165 MB   /run/sock/api1.sock
-  └──▶ api 2 (Go)              0.45 CPU / 165 MB   /run/sock/api2.sock
+  ├──▶ api 1 (Go)              0.40 CPU / 165 MB   /run/sock/api1.sock
+  └──▶ api 2 (Go)              0.40 CPU / 165 MB   /run/sock/api2.sock
                               ───────────────────
                               1.00 CPU / 350 MB
 ```

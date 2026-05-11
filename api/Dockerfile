@@ -14,6 +14,10 @@ COPY api ./api
 COPY vector-search ./vector-search
 COPY infra ./infra
 ENV CGO_ENABLED=0
+# GOAMD64=v3 targets Haswell+ (AVX2, BMI2, FMA, MOVBE). The avaliador's
+# Mac Mini Late 2014 is Haswell, so v3 is safe and lets the Go compiler
+# emit better code than the conservative v1 baseline.
+ENV GOAMD64=v3
 RUN go build -trimpath -ldflags="-s -w" -o /out/api ./api
 RUN go build -trimpath -ldflags="-s -w" -o /out/indexer ./vector-search/indexer
 

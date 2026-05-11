@@ -7,6 +7,7 @@ import (
 	"runtime"
 	"runtime/debug"
 	"strings"
+	"time"
 
 	"github.com/valyala/fasthttp"
 
@@ -81,15 +82,40 @@ func main() {
 	}
 
 	srv := &fasthttp.Server{
-		Handler:                       s.handler,
-		Name:                          "rinha26",
-		ReadBufferSize:                4096,
-		WriteBufferSize:               1024,
-		MaxRequestBodySize:            8 << 10,
-		NoDefaultServerHeader:         true,
-		NoDefaultContentType:          true,
-		NoDefaultDate:                 true,
+		Handler: s.handler,
+		Name:    "rinha26",
+
+		// Tight buffers — request bodies are <1KB, responses ~35B.
+		ReadBufferSize:     2048,
+		WriteBufferSize:    256,
+		MaxRequestBodySize: 8 << 10,
+
+		// Strip default headers we don't need: saves ~50B written per
+		// response, and skips the Date formatter (which would call
+		// time.Now and format every second).
+		NoDefaultServerHeader: true,
+		NoDefaultContentType:  true,
+		NoDefaultDate:         true,
+
+		// fasthttp normalizes "content-type" → "Content-Type" by default;
+		// disabling saves a few cycles per header. We control header names
+		// explicitly via SetContentTypeBytes.
 		DisableHeaderNamesNormalizing: true,
+
+		// Reduce keep-alive churn from nginx. Default ReadTimeout=0
+		// means no timeout; explicit values are friendlier under load.
+		ReadTimeout:  2 * time.Second,
+		WriteTimeout: 2 * time.Second,
+		IdleTimeout:  60 * time.Second,
+
+		// Per-conn concurrency. Each goroutine handles one request at a
+		// time on its connection; under our LB the keepalive pool has 64
+		// idle conns so 256 covers bursts comfortably.
+		Concurrency: 256,
+
+		// Pre-allocated request context pool — fasthttp does this by
+		// default, but explicit so it shows up when reading the config.
+		ReduceMemoryUsage: false,
 	}
 
 	log.Printf("listening on %s", listenAddr)

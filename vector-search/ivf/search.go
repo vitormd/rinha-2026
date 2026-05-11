@@ -2,6 +2,7 @@ package ivf
 
 import (
 	"math"
+	"sync"
 	"unsafe"
 
 	"rinha26/infra/simd"
@@ -13,6 +14,16 @@ import (
 // vectors counted to compute fraud_score. Distinct from `K` (the number of
 // IVF centroids).
 const topK = 5
+
+// distsBufPool reuses the centroid-distance slice across requests. Each
+// allocation is K × 8 bytes (~33 KB at K=4096); avoiding it on the hot path
+// removes GC pressure and one large make() per request.
+var distsBufPool = sync.Pool{
+	New: func() any {
+		buf := make([]float64, 0, 4096)
+		return &buf
+	},
+}
 
 // FraudScore returns how many of the top-K nearest references carry the
 // fraud label.
@@ -35,16 +46,30 @@ func (i *Index) FraudScore(query *[vec.Dim]float64, fast, full int) int {
 	}
 
 	queryInt32 := prepareQueryForSIMD(query)
-	centroidDistances := computeCentroidDistances(query, i.Centroids, K)
 
-	fastChosen := pickTopFromDists(centroidDistances, K, fast)
+	// Borrow a centroid-distance buffer for this request.
+	bufPtr := distsBufPool.Get().(*[]float64)
+	dists := (*bufPtr)[:0]
+	if cap(dists) < K {
+		dists = make([]float64, K)
+	} else {
+		dists = dists[:K]
+	}
+	defer func() {
+		*bufPtr = dists[:0]
+		distsBufPool.Put(bufPtr)
+	}()
+
+	computeCentroidDistances(query, i.CentroidsF64, i.CentroidNormsSq, K, dists)
+
+	fastChosen := pickTopFromDists(dists, K, fast)
 	fastCount := i.scanClusters(&queryInt32, fastChosen)
 
 	if full <= fast || (fastCount != 2 && fastCount != 3) {
 		return fastCount
 	}
 
-	fullChosen := pickTopFromDists(centroidDistances, K, full)
+	fullChosen := pickTopFromDists(dists, K, full)
 	return i.scanClusters(&queryInt32, fullChosen)
 }
 
@@ -62,27 +87,32 @@ func prepareQueryForSIMD(query *[vec.Dim]float64) [16]int32 {
 	return padded
 }
 
-// computeCentroidDistances returns the squared L2 distance from query to
-// each centroid, in float64. Float64 here (vs float32) keeps the top-N
-// cluster ordering stable: an f32 sum of 14 squared diffs can flip ranks at
-// the ulp level on edge queries, costing recall for those.
-func computeCentroidDistances(query *[vec.Dim]float64, centroids []float32, K int) []float64 {
-	out := make([]float64, K)
+// computeCentroidDistances fills `out` with a rank-equivalent score of the
+// squared L2 distance from the query to each centroid:
+//
+//	||q - c||² = ||q||² + ||c||² - 2·<q, c>
+//
+// ||q||² is constant per query so it drops out of the ranking; the loop
+// computes only `||c||² - 2·<q, c>` per centroid (one FMA per dim instead
+// of sub+mul+add). Pre-computed normsSq comes from Index.CentroidNormsSq.
+//
+// `out[c]` is therefore NOT the true squared distance — it's an additive
+// constant away from it. Top-N ordering and tie-breaking are preserved
+// exactly because ||q||² is shared by all candidates.
+func computeCentroidDistances(query *[vec.Dim]float64, centroids, normsSq []float64, K int, out []float64) {
 	for c := 0; c < K; c++ {
 		base := c * vec.Dim
-		var d float64
+		var dot float64
 		for j := 0; j < vec.Dim; j++ {
-			x := query[j] - float64(centroids[base+j])
-			d += x * x
+			dot += query[j] * centroids[base+j]
 		}
-		out[c] = d
+		out[c] = normsSq[c] - 2.0*dot
 	}
-	return out
 }
 
 // scanClusters scans the given clusters one block at a time, computing 8
-// squared int64 distances per block (via distBlock — AVX2 on amd64, scalar
-// fallback elsewhere) and tracking the global top-K.
+// squared int64 distances per block (via simd.DistBlock — AVX2 on amd64,
+// scalar fallback elsewhere) and tracking the global top-K.
 //
 // Distances are int64 because the int16 scale-10000 quantization yields
 // per-block distance sums up to ~5.6e9, which exceeds int32. int64 also

@@ -46,8 +46,11 @@ verify-quick: ## Verify against first 5k entries (10× faster, useful for iterat
 bench-py: ## Local Python benchmark with single keep-alive connection
 	python3 scripts/bench.py --n 1000 --warmup 100
 
-bench-k6: ## Run the official k6 ramping benchmark (1→900 RPS over 120s)
+bench-k6: ## Run the official k6 ramping benchmark (1→900 RPS over 120s, ~125s total)
 	K6_NO_USAGE_REPORT=true k6 run test/test.js
+
+bench-quick: ## Faster benchmark — same logic but 30s ramp (~32s total), ~4x faster iteration
+	K6_NO_USAGE_REPORT=true k6 run test/test-quick.js
 
 test: ## Run Go unit tests
 	docker compose run --rm --no-deps --entrypoint='' api1 sh -c 'cd /src && go test ./...' || \
