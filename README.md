@@ -9,13 +9,20 @@ client
   │
   ▼
 nginx (porta 9999)            0.10 CPU /  20 MB
-  ├─ round-robin
+  ├─ round-robin via UDS
   │
-  ├──▶ api 1 (Go)              0.45 CPU / 165 MB
-  └──▶ api 2 (Go)              0.45 CPU / 165 MB
+  ├──▶ api 1 (Go)              0.45 CPU / 165 MB   /run/sock/api1.sock
+  └──▶ api 2 (Go)              0.45 CPU / 165 MB   /run/sock/api2.sock
                               ───────────────────
                               1.00 CPU / 350 MB
 ```
+
+nginx ↔ APIs comunicam por **Unix Domain Socket** num volume tmpfs compartilhado (`sock`) — sem TCP loopback no caminho dos dados.
+
+Stack:
+- Go 1.24
+- [fasthttp](https://github.com/valyala/fasthttp) (substitui `net/http` — zero alloc por request)
+- [jsonparser](https://github.com/buger/jsonparser) na vetorização
 
 ## Pipeline de inferência
 

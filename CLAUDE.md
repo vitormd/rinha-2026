@@ -6,13 +6,19 @@ Implementation in Go for [Rinha de Backend 2026](https://github.com/zanfrancesch
 
 ```
 nginx LB (alpine-slim, 0.10 CPU / 20 MB)
-  └── round-robin to 2× Go API (0.45 CPU / 165 MB each)
-                            = 1.00 CPU / 350 MB total (spec hard limit)
+  └── UDS round-robin to 2× Go API (0.45 CPU / 165 MB each)
+        /run/sock/api{1,2}.sock         = 1.00 CPU / 350 MB total (spec hard limit)
 
 per request:
-  parse JSON → vec.FromPayload (14-D float64) → quant.EncodeVec (i16, scale 10000)
-  → IVF 2-stage probing (fast=8, full=28 if count∈{2,3})
-  → top-5 fraud count → pre-formatted JSON response
+  fasthttp parses HTTP (zero-alloc) →
+  vec.FromPayload (14-D float64) → quant.EncodeVec (i16, scale 10000) →
+  IVF 2-stage probing (fast=8, full=28 if count∈{2,3}) →
+  top-5 fraud count → pre-formatted JSON response
+
+Server stack:
+  Go 1.24 (toolchain auto-managed)
+  github.com/valyala/fasthttp — replaces net/http (no per-req alloc; UDS-friendly)
+  github.com/buger/jsonparser — vectorization path
 ```
 
 Index file `ivf.bin` (v4 format, 84 MB):
@@ -52,6 +58,15 @@ LB/                           load balancer
   scripts/                    verify.py, bench.py, tune.sh
 ```
 
+## Performance milestones
+
+| iteration | image tag | p99 (avaliador) | score_p99 | score_det | final |
+|---|---|---:|---:|---:|---:|
+| v1 (TCP + net/http) | vitormd-go-v1 | 92.73 ms | 1032.78 | 3000 | **4032.78** |
+| v2 (UDS + fasthttp) | vitormd-go-v2 | pending | | | |
+
+Both iterations preserve E=0 (perfect detection); only `score_p99` changes.
+
 ## Critical decisions (with rationale — don't undo without re-verifying 0 errors)
 
 1. **int64 accumulator for distance** — f32 was tried and regressed E=0 → E=10. f32's 23-bit mantissa rounds 5th-vs-6th nearest ties together at boundary queries.
@@ -63,6 +78,9 @@ LB/                           load balancer
 7. **2 API instances even on shared CPU** — spec requires it (LB does round-robin between two backends). 1 process would be ~5-15% faster but risks DQ.
 8. **AVX2 asm uses i32→i32→i64 widening for sq dist** — i32 acc would overflow over 14 dims; i64 acc requires `VPMOVZXDQ` + extract-high pattern.
 9. **`infra/simd` owns its layout constants** (Dim=14, BlockSize=8) — the asm is hand-unrolled for these. ivf imports simd's `Block`, `Query`, `Distances` types.
+10. **API listens on UDS, not TCP** — `LISTEN_ADDR` env var: a path like `/run/sock/api1.sock` triggers `net.Listen("unix", ...)`; `:8080` falls back to TCP. nginx upstream uses `server unix:/run/sock/apiN.sock;`. Saves ~30µs of TCP loopback per request under load.
+11. **fasthttp instead of net/http** — net/http allocates a Request/ResponseWriter pair per request; fasthttp uses a pooled `RequestCtx`. Trade-off: fasthttp API isn't compatible with stdlib middleware, but we don't use any.
+12. **API container runs as root** — required to bind the UDS on the `/run/sock` shared tmpfs volume (the named volume is owned by root at mount time and chown can't run before bind). Single-tenant benchmark image; no security concern.
 
 ## Key files
 
@@ -106,7 +124,8 @@ docker run --rm -v "$PWD":/src -w /src golang:1.23-alpine sh -c 'go vet ./... &&
 - **Build-host RAM**: indexer holds 3M × 14 × 8 = ~336 MB float64 in memory. e2-small borderline; e2-medium and Mac Docker fine.
 - **proxy memory on Linux is strict**: a Go TCP proxy with goroutine-per-conn OOM-killed at 20 MB cgroup limit (kernel TCP buffers + Go runtime). nginx alpine-slim sits at 3 MB. Don't reintroduce a Go proxy without epoll+single-thread.
 - **Docker Desktop on Mac doesn't enforce cgroup memory limits the way Linux does** — what passes locally may OOM on the avaliador.
-- **GCP VM `rinha26-bench` exists** in project `rinha-2026`, zone `us-east1-b`. Stop with `gcloud compute instances stop rinha26-bench --zone=us-east1-b`.
+- **GCP VM `rinha26-bench` exists** in project `rinha-2026`, zone `us-east1-b`. Stop with `gcloud compute instances stop rinha26-bench --zone=us-east1-b`. Used for native linux/amd64 image builds (Docker on Mac arm64 emulates qemu, very slow for the indexer step).
+- **Docker Hub auth**: `~/.docker/config.json` on Mac uses `credsStore: desktop` (keychain) — credentials are NOT in the file. To `docker login` on the VM, ssh interactively (`gcloud compute ssh rinha26-bench --zone=us-east1-b` then `sudo docker login -u vitormd`).
 
 ## Module/import conventions
 
@@ -131,10 +150,23 @@ docker run --rm -v "$PWD":/src -w /src golang:1.23-alpine sh -c 'go vet ./... &&
 | f32 cluster scan | E=10 with same n_probe | ulp precision loss at boundaries |
 | RoundToEven quantization | E=10 | Doesn't match C `round()` used by data-generator |
 
-## Submission steps (when ready)
+## Submission state
 
-1. `docker push youruser/rinha26-api:vX` (publish image)
-2. Branch `submission`: update `docker-compose.yml` to use the public image (no `build:` directive)
-3. Add `participants/<your-github-user>.json` to upstream repo via PR
-4. Open issue with `rinha/test` in body — avaliador runs automatically and posts to temporary-results
+- GitHub repo: `git@github.com:vitormd/rinha-2026.git` (branches `main` and `submission` mirror each other; submission is what the avaliador clones).
+- Public image: `docker.io/vitormd/rinha26-api:vitormd-go-v2` (linux/amd64; v1 also still pushed).
+- Participants file `vitormd.json` already merged in the upstream repo with `id=vitormd-go`.
+- New runs: open a new issue at `zanfranceschi/rinha-de-backend-2026` with `rinha/test` in body; the avaliador picks up the latest commit on the `submission` branch.
+
+## Re-submitting an updated build
+
+1. Make changes on `main`, validate locally (`make verify` → must say `weighted E: 0`).
+2. Start the GCP VM and build amd64:
+   ```
+   gcloud compute instances start rinha26-bench --zone=us-east1-b
+   gcloud compute scp /tmp/rinha26-src.tgz rinha26-bench:/home/... --zone=us-east1-b
+   gcloud compute ssh rinha26-bench --zone=us-east1-b --command='cd ~/rinha26-build && sudo docker build -t vitormd/rinha26-api:vitormd-go-v3 ... && sudo docker push ...'
+   gcloud compute instances stop rinha26-bench --zone=us-east1-b
+   ```
+3. Bump the image tag in `docker-compose.yml` to `:vitormd-go-vN`, commit, push `submission`.
+4. Open a new issue with `rinha/test` to trigger the avaliador.
 
